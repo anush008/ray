@@ -15,7 +15,7 @@ import ray
 import ray.actor
 from ray import serve
 from ray._common.test_utils import SignalActor, wait_for_condition
-from ray.serve._private.common import DeploymentID, ReplicaID
+from ray.serve._private.common import DeploymentID, ReplicaID, ReplicaState
 from ray.serve._private.constants import (
     RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE,
     SERVE_DEFAULT_APP_NAME,
@@ -1236,6 +1236,137 @@ def test_sparse_config_rollback_restores_code_defined_options(
         assert _deployment_details(client).deployment_config.max_ongoing_requests == 7
         before = len(responses)
         wait_for_condition(lambda: len(responses) >= before + 20, timeout=15)
+
+
+def test_surge_rolling_update_failure_keeps_capacity(serve_instance):
+    """A failed surge update preserves all old replicas, and rollback reuses them."""
+    client = serve_instance
+    app_config = {
+        "name": "default",
+        "import_path": "ray.serve.tests.test_config_files.fail_on_flag.build",
+        "deployments": [
+            {"name": "FailOnFlag", "num_replicas": 3, "max_surge_percent": 34}
+        ],
+    }
+    client.deploy_apps(ServeDeploySchema(**{"applications": [app_config]}))
+    wait_for_condition(check_running)
+    initial_pids = _running_replica_pids(client)
+    assert len(initial_pids) == 3
+
+    failing_config = copy(app_config)
+    failing_config["deployments"] = [
+        {
+            "name": "FailOnFlag",
+            "num_replicas": 3,
+            "max_surge_percent": 34,
+            "ray_actor_options": {"runtime_env": {"env_vars": {"FAIL_ON_INIT": "1"}}},
+        }
+    ]
+    client.deploy_apps(ServeDeploySchema(**{"applications": [failing_config]}))
+
+    def check_deploy_failed():
+        status = serve.status().applications["default"]
+        assert status.status == ApplicationStatus.DEPLOY_FAILED
+        deployment_status = status.deployments["FailOnFlag"]
+        assert deployment_status.status_trigger == "REPLICA_STARTUP_FAILED"
+        assert set(deployment_status.replica_states) == {"RUNNING"}
+        return True
+
+    wait_for_condition(check_deploy_failed, timeout=60)
+    # Failed replacements leave every old replica serving.
+    assert _running_replica_pids(client) == initial_pids
+    _assert_rollout_stopped(client, initial_pids)
+
+    client.deploy_apps(ServeDeploySchema(**{"applications": [app_config]}))
+    wait_for_condition(check_running)
+    assert _running_replica_pids(client) == initial_pids
+
+
+@pytest.mark.parametrize("rebuild", [True, False])
+def test_surge_rolling_update_success_keeps_capacity(serve_instance, rebuild):
+    """A successful surge update keeps serving while replacing every old replica."""
+    client = serve_instance
+    gate_name = "surge_startup_gate"
+    gate = SignalActor.options(name=gate_name, namespace=SERVE_NAMESPACE).remote()
+
+    def config(version, wait_for_gate=False):
+        deployment = {
+            "name": "SurgeUpdate",
+            "num_replicas": 3,
+            "max_surge_percent": 34,
+        }
+        app = {
+            "name": "default",
+            "import_path": "ray.serve.tests.test_config_files.surge_update.build",
+            "deployments": [deployment],
+        }
+        gate_arg = gate_name if wait_for_gate else ""
+        if rebuild:
+            app["args"] = {"version": version, "startup_gate": gate_arg}
+        else:
+            deployment["ray_actor_options"] = {
+                "runtime_env": {
+                    "env_vars": {"SURGE_VERSION": version, "SURGE_GATE": gate_arg}
+                }
+            }
+        return ServeDeploySchema(applications=[app])
+
+    try:
+        client.deploy_apps(config("v1"))
+        wait_for_condition(check_running, timeout=120)
+
+        def replica_states():
+            return ray.get(
+                client._controller._dump_replica_states_for_testing.remote(
+                    DeploymentID(name="SurgeUpdate", app_name="default")
+                )
+            )
+
+        initial_ids = {
+            r.replica_id for r in replica_states().get(states=[ReplicaState.RUNNING])
+        }
+        assert len(initial_ids) == 3
+
+        with _continuous_http_traffic({"v1", "v2"}) as responses:
+            client.deploy_apps(config("v2", wait_for_gate=True))
+            released = False
+            deadline = time.monotonic() + 120
+            while True:
+                states = replica_states()
+                running_ids = {
+                    r.replica_id for r in states.get(states=[ReplicaState.RUNNING])
+                }
+                active = states.get(
+                    states=[
+                        ReplicaState.STARTING,
+                        ReplicaState.UPDATING,
+                        ReplicaState.RUNNING,
+                        ReplicaState.RECOVERING,
+                    ]
+                )
+                assert len(running_ids) >= 3, running_ids
+                assert len(active) <= 5, len(active)
+                if not released:
+                    assert initial_ids <= running_ids
+                    if ray.get(gate.cur_num_waiters.remote()) == 2:
+                        # Both surge slots are occupied, with every old replica serving.
+                        assert len(active) == 5
+                        assert running_ids == initial_ids
+                        ray.get(gate.send.remote())
+                        released = True
+                elif len(states.get()) == 3 and initial_ids.isdisjoint(running_ids):
+                    break
+                assert time.monotonic() < deadline, running_ids
+                time.sleep(0.05)
+
+            wait_for_condition(check_running, timeout=120)
+            assert _deployment_details(client, "SurgeUpdate").status == "HEALTHY"
+            before = responses.count("v2")
+            wait_for_condition(lambda: responses.count("v2") >= before + 20, timeout=15)
+            assert "v1" in responses
+    finally:
+        ray.get(gate.send.remote())
+        ray.kill(gate)
 
 
 if __name__ == "__main__":

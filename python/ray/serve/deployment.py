@@ -259,6 +259,7 @@ class Deployment:
         deployment_actors: Default[
             Optional[List[Union[Dict, DeploymentActorConfig]]]
         ] = DEFAULT.VALUE,
+        max_surge_percent: Default[int] = DEFAULT.VALUE,
     ) -> "Deployment":
         """Return a copy of this deployment with updated options.
 
@@ -337,6 +338,9 @@ class Deployment:
             new_deployment_config.max_constructor_retry_count = (
                 max_constructor_retry_count
             )
+
+        if max_surge_percent is not DEFAULT.VALUE:
+            new_deployment_config.max_surge_percent = max_surge_percent
 
         if func_or_class is None:
             func_or_class = self._replica_config.deployment_def
@@ -515,6 +519,7 @@ def deployment_to_schema(d: Deployment) -> DeploymentSchema:
         "gang_scheduling_config": d._deployment_config.gang_scheduling_config,
         "deployment_actors": d._deployment_config.deployment_actors,
         "rolling_update_percentage": d._deployment_config.rolling_update_percentage,
+        "max_surge_percent": d._deployment_config.max_surge_percent,
     }
 
     # Let non-user-configured options be set to defaults. If the schema
@@ -580,6 +585,7 @@ def schema_to_deployment(s: DeploymentSchema) -> Deployment:
         gang_scheduling_config=s.gang_scheduling_config,
         deployment_actors=s.deployment_actors,
         rolling_update_percentage=s.rolling_update_percentage,
+        max_surge_percent=s.max_surge_percent,
     )
     deployment_config.user_configured_option_names = (
         s._get_user_configured_option_names()
